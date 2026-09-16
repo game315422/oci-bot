@@ -1,0 +1,20 @@
+services:
+  oci-bot:
+    build: .
+    container_name: oci-tg-bot
+    restart: always
+    environment:
+      # ====== Telegram 机器人必填参数 ======
+      - TG_BOT_TOKEN=883214
+      - TG_ADMIN_ID=5921
+
+      # ====== 可选默认参数（有默认值，可不改） ======
+      - DEFAULT_ROOT_PASSWORD=root315.  # 默认 root 密码
+      - MONTHLY_QUOTA_GB=10000                  # 每月免费流量额度 (GB)
+      - DEFAULT_INTERVAL=150                     # 抢机轮询默认间隔 (秒)
+      - MIN_INTERVAL=30                         # 抢机轮询最小间隔 (秒)
+      - TZ=Asia/Shanghai
+    volumes:
+      # 挂载多账号凭据目录（内部自动识别任意名字的 .pem 和文本文件）
+      - /root/docker/oci-bot/accounts:/app/accounts:ro
+      - /etc/localtime:/etc/localtime:ro
