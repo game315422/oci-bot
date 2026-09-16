@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import time
+import urllib.request
 import configparser
 import oci
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -31,6 +32,31 @@ def add_bot_log(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     LOG_HISTORY.append(f"[{ts}] {msg}")
     logger.info(msg)
+
+# ================= 服务端 VPS 公网 IP 自动获取与缓存 =================
+SERVER_IP = "Unknown"
+
+def get_server_ip() -> str:
+    global SERVER_IP
+    if SERVER_IP != "Unknown":
+        return SERVER_IP
+    apis = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
+    ]
+    for api in apis:
+        try:
+            req = urllib.request.Request(api, headers={"User-Agent": "curl/7.68.0"})
+            with urllib.request.urlopen(req, timeout=2.5) as resp:
+                if resp.status == 200:
+                    ip = resp.read().decode("utf-8").strip()
+                    if ip:
+                        SERVER_IP = ip
+                        return SERVER_IP
+        except Exception:
+            continue
+    return SERVER_IP
 
 # ================= 1. 读取环境变量配置 =================
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
@@ -627,8 +653,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     acc_obj = ACCOUNTS[current_acc]
     target_count = spec.get("target_count", 1)
+    server_ip = get_server_ip()
 
     await update.message.reply_text(
+        f"🖥 *运行节点 IP*: `{server_ip}`\n"
         f"🎮 *甲骨文多账号运维控制台*\n\n"
         f"• 当前选中账号: *{current_acc}*\n"
         f"• 所属区域: `{acc_obj.config_dict['region']}`\n"
@@ -673,7 +701,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_running_loop()
 
     if data == "menu_main":
+        server_ip = get_server_ip()
         await query.edit_message_text(
+            f"🖥 *运行节点 IP*: `{server_ip}`\n"
             "🎮 *甲骨文多账号运维控制台*",
             parse_mode="Markdown",
             reply_markup=build_main_keyboard(is_sniping, current_acc_name, spec, interval),
@@ -833,7 +863,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         desc = f"{int(spec['ocpus'])}C {int(spec['memory'])}G" if spec["arch"] == "ARM" else "1C 1G"
         add_bot_log(f"[*] 账号 [{current_acc_name}] 启动抢机 (目标: {target_count} 台)")
 
+        server_ip = get_server_ip()
         await query.edit_message_text(
+            f"🖥 *运行节点 IP*: `{server_ip}`\n"
             f"🚀 *账号 [{current_acc_name}] 抢机任务已启动！*\n"
             f"• 规格: `{spec['arch']} ({desc})`\n"
             f"• 🎯 目标开机数量: `{target_count} 台`\n"
