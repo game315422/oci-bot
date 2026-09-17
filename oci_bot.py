@@ -588,25 +588,20 @@ def delete_single_boot_volume(acc: OCIAccount, boot_volume_id: str) -> None:
     acc.invalidate_cache()
 
 
-# ================= 彻底修复：精准获取并释放 Private IP 上的临时公网 IP =================
 def change_public_ip(acc: OCIAccount, instance_id: str) -> str:
-    # 1. 查找主 VNIC
     vnics = acc.compute_client.list_vnic_attachments(acc.compartment_id, instance_id=instance_id).data
     if not vnics:
         raise RuntimeError("该实例未关联任何网卡")
     vnic_id = vnics[0].vnic_id
 
-    # 获取当前旧公网 IP（用于回显提示）
     vnic_obj = acc.network_client.get_vnic(vnic_id).data
     old_ip = vnic_obj.public_ip or "无"
 
-    # 2. 获取主 Private IP 实体
     private_ips = acc.network_client.list_private_ips(vnic_id=vnic_id).data
     primary_private_ip = next((ip for ip in private_ips if ip.is_primary), None)
     if not primary_private_ip:
         raise RuntimeError("未找到主 Private IP")
 
-    # 3. 使用专属 API 精准查询绑定在 private_ip_id 上的临时 Public IP
     current_pub_ip_obj = None
     try:
         current_pub_ip_obj = acc.network_client.get_public_ip_by_private_ip_id(
@@ -616,11 +611,9 @@ def change_public_ip(acc: OCIAccount, instance_id: str) -> str:
         if e.status != 404:
             raise RuntimeError(f"获取公网 IP 异常: {e.message}")
 
-    # 4. 若存在公网 IP，执行删除并轮询直到完全解绑
     if current_pub_ip_obj:
         acc.network_client.delete_public_ip(current_pub_ip_obj.id)
 
-        # 循环等待旧 IP 彻底消失（API 抛出 404 即表示已释放干净）
         is_cleared = False
         for _ in range(20):
             time.sleep(2)
@@ -638,7 +631,6 @@ def change_public_ip(acc: OCIAccount, instance_id: str) -> str:
         if not is_cleared:
             raise RuntimeError("释放旧公网 IP 超时，后台尚未完全解绑，请稍后重试。")
 
-    # 5. 此时 Private IP 已完全处于无公网 IP 状态，创建全新临时公网 IP
     new_pip = acc.network_client.create_public_ip(
         oci.core.models.CreatePublicIpDetails(
             compartment_id=acc.compartment_id,
@@ -789,7 +781,7 @@ async def sniper_job(context: ContextTypes.DEFAULT_TYPE):
             )
 
 
-# ================= 5. TG 交互键盘构建 =================
+# ================= 5. TG 交互键盘构建（支持 150G / 200G 动态高亮） =================
 def get_account_state(chat_data: dict, acc_name: str) -> dict:
     return chat_data.setdefault("accounts_state", {}).setdefault(acc_name, {
         "is_sniping": False,
@@ -981,6 +973,8 @@ def build_spec_keyboard(spec: dict):
 
     is_disk_50 = (boot_gbs == 50)
     is_disk_100 = (boot_gbs == 100)
+    is_disk_150 = (boot_gbs == 150)
+    is_disk_200 = (boot_gbs == 200)
 
     btn_arm_1_6 = f"{'✅ ' if is_arm_1_6 else '🔘 '}ARM 1C 6G (免费)"
     btn_arm_2_12 = f"{'✅ ' if is_arm_2_12 else '🔘 '}ARM 2C 12G"
@@ -989,11 +983,14 @@ def build_spec_keyboard(spec: dict):
 
     btn_disk_50 = f"{'✅ ' if is_disk_50 else '💾 '}硬盘: 50 GB"
     btn_disk_100 = f"{'✅ ' if is_disk_100 else '💾 '}硬盘: 100 GB"
+    btn_disk_150 = f"{'✅ ' if is_disk_150 else '💾 '}硬盘: 150 GB"
+    btn_disk_200 = f"{'✅ ' if is_disk_200 else '💾 '}硬盘: 200 GB"
 
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(btn_arm_1_6, callback_data="set_arm_1_6"), InlineKeyboardButton(btn_arm_2_12, callback_data="set_arm_2_12")],
         [InlineKeyboardButton(btn_arm_4_24, callback_data="set_arm_4_24"), InlineKeyboardButton(btn_amd_1_1, callback_data="set_amd_1_1")],
         [InlineKeyboardButton(btn_disk_50, callback_data="set_disk_50"), InlineKeyboardButton(btn_disk_100, callback_data="set_disk_100")],
+        [InlineKeyboardButton(btn_disk_150, callback_data="set_disk_150"), InlineKeyboardButton(btn_disk_200, callback_data="set_disk_200")],
         [
             InlineKeyboardButton("🔢 目标数量:", callback_data="none"),
             InlineKeyboardButton(f"{'✅ ' if target_count==1 else ''}1台", callback_data="set_count_1"),
@@ -1535,6 +1532,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "set_disk_100":
         spec["boot_gbs"] = 100
         await query.edit_message_text(f"⚙️ *[{current_acc_name}] 硬盘调整*\n\n引导卷已设为: *100 GB*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
+
+    elif data == "set_disk_150":
+        spec["boot_gbs"] = 150
+        await query.edit_message_text(f"⚙️ *[{current_acc_name}] 硬盘调整*\n\n引导卷已设为: *150 GB*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
+
+    elif data == "set_disk_200":
+        spec["boot_gbs"] = 200
+        await query.edit_message_text(f"⚙️ *[{current_acc_name}] 硬盘调整*\n\n引导卷已设为: *200 GB*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
 
     elif data.startswith("set_count_"):
         new_cnt = int(data.split("_")[2])
