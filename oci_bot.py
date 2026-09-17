@@ -588,31 +588,63 @@ def delete_single_boot_volume(acc: OCIAccount, boot_volume_id: str) -> None:
     acc.invalidate_cache()
 
 
+# ================= 彻底修复：精准获取并释放 Private IP 上的临时公网 IP =================
 def change_public_ip(acc: OCIAccount, instance_id: str) -> str:
+    # 1. 查找主 VNIC
     vnics = acc.compute_client.list_vnic_attachments(acc.compartment_id, instance_id=instance_id).data
     if not vnics:
         raise RuntimeError("该实例未关联任何网卡")
     vnic_id = vnics[0].vnic_id
 
+    # 获取当前旧公网 IP（用于回显提示）
+    vnic_obj = acc.network_client.get_vnic(vnic_id).data
+    old_ip = vnic_obj.public_ip or "无"
+
+    # 2. 获取主 Private IP 实体
     private_ips = acc.network_client.list_private_ips(vnic_id=vnic_id).data
-    primary_ip = next((ip for ip in private_ips if ip.is_primary), None)
-    if not primary_ip:
+    primary_private_ip = next((ip for ip in private_ips if ip.is_primary), None)
+    if not primary_private_ip:
         raise RuntimeError("未找到主 Private IP")
 
-    public_ips = acc.network_client.list_public_ips(scope="REGION", compartment_id=acc.compartment_id).data
-    current_pip = next((p for p in public_ips if p.private_ip_id == primary_ip.id), None)
-    old_ip = current_pip.ip_address if current_pip else "无"
+    # 3. 使用专属 API 精准查询绑定在 private_ip_id 上的临时 Public IP
+    current_pub_ip_obj = None
+    try:
+        current_pub_ip_obj = acc.network_client.get_public_ip_by_private_ip_id(
+            oci.core.models.GetPublicIpByPrivateIpIdDetails(private_ip_id=primary_private_ip.id)
+        ).data
+    except oci.exceptions.ServiceError as e:
+        if e.status != 404:
+            raise RuntimeError(f"获取公网 IP 异常: {e.message}")
 
-    if current_pip:
-        acc.network_client.delete_public_ip(current_pip.id)
-        time.sleep(3)
+    # 4. 若存在公网 IP，执行删除并轮询直到完全解绑
+    if current_pub_ip_obj:
+        acc.network_client.delete_public_ip(current_pub_ip_obj.id)
 
+        # 循环等待旧 IP 彻底消失（API 抛出 404 即表示已释放干净）
+        is_cleared = False
+        for _ in range(20):
+            time.sleep(2)
+            try:
+                acc.network_client.get_public_ip_by_private_ip_id(
+                    oci.core.models.GetPublicIpByPrivateIpIdDetails(private_ip_id=primary_private_ip.id)
+                )
+            except oci.exceptions.ServiceError as se:
+                if se.status == 404:
+                    is_cleared = True
+                    break
+            except Exception:
+                pass
+
+        if not is_cleared:
+            raise RuntimeError("释放旧公网 IP 超时，后台尚未完全解绑，请稍后重试。")
+
+    # 5. 此时 Private IP 已完全处于无公网 IP 状态，创建全新临时公网 IP
     new_pip = acc.network_client.create_public_ip(
         oci.core.models.CreatePublicIpDetails(
             compartment_id=acc.compartment_id,
             lifetime="EPHEMERAL",
-            private_ip_id=primary_ip.id,
-            display_name="new-ip",
+            private_ip_id=primary_private_ip.id,
+            display_name=f"new-ip-{int(time.time())}"[-15:],
         )
     ).data
 
@@ -757,7 +789,7 @@ async def sniper_job(context: ContextTypes.DEFAULT_TYPE):
             )
 
 
-# ================= 5. TG 交互键盘构建（支持状态高亮变绿） =================
+# ================= 5. TG 交互键盘构建 =================
 def get_account_state(chat_data: dict, acc_name: str) -> dict:
     return chat_data.setdefault("accounts_state", {}).setdefault(acc_name, {
         "is_sniping": False,
@@ -1375,7 +1407,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ 实例映射已过期", reply_markup=build_main_keyboard(is_sniping, current_acc_name, spec, interval))
             return
 
-        await query.edit_message_text("⏳ 正在更换 IP，请稍候...")
+        await query.edit_message_text("⏳ 正在安全解绑旧 IP 并申请全新公网 IP，请稍候...")
         try:
             res_str = await loop.run_in_executor(None, change_public_ip, acc, inst_id)
             add_bot_log(f"[{acc.name}] 换 IP 成功: {res_str}")
