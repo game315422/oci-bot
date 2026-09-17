@@ -25,7 +25,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# 内存日志队列（保留最近 50 条供 TG 面板查看）
 LOG_HISTORY = deque(maxlen=50)
 
 def add_bot_log(msg: str):
@@ -137,6 +136,9 @@ class OCIAccount:
         return cfg
 
     def ensure_network_ready(self):
+        if self.availability_domain and self.subnet_id:
+            return
+
         if not self.availability_domain:
             ads = self.identity_client.list_availability_domains(self.compartment_id).data
             if ads:
@@ -193,10 +195,7 @@ class OCIAccount:
         add_bot_log(f"[{self.name}] 默认公网已就绪: {self.subnet_id}")
 
     def open_all_security_ports(self) -> str:
-        """遍历账号下所有 VCN 的安全列表和安全组，彻底放开 0.0.0.0/0 所有入站端口"""
         self.ensure_network_ready()
-        
-        # 1. 查询该区间下所有 VCN
         vcns = self.network_client.list_vcns(self.compartment_id).data
         if not vcns:
             raise RuntimeError("未在当前区间检测到任何可用 VCN")
@@ -205,10 +204,8 @@ class OCIAccount:
         modified_nsgs = 0
 
         for vcn in vcns:
-            # 2. 处理该 VCN 下的所有安全列表 (Security Lists)
             sec_lists = self.network_client.list_security_lists(self.compartment_id, vcn_id=vcn.id).data
             for sec_list in sec_lists:
-                # 检查是否已存在全放行规则
                 has_all_open = any(
                     rule.protocol == "all" and rule.source == "0.0.0.0/0"
                     for rule in sec_list.ingress_security_rules
@@ -232,7 +229,6 @@ class OCIAccount:
                 self.network_client.update_security_list(sec_list.id, update_details)
                 modified_lists += 1
 
-            # 3. 处理该 VCN 下的所有网络安全组 (NSG)
             try:
                 nsgs = self.network_client.list_network_security_groups(
                     compartment_id=self.compartment_id, 
@@ -266,7 +262,6 @@ class OCIAccount:
 
 ACCOUNTS: dict[str, OCIAccount] = {}
 
-
 def reload_all_accounts():
     global ACCOUNTS
     ACCOUNTS.clear()
@@ -283,7 +278,6 @@ def reload_all_accounts():
                 add_bot_log(f"[+] 成功载入账号: [{item}] ({acc.config_dict['region']})")
             except Exception as e:
                 add_bot_log(f"[-] 载入账号 [{item}] 失败: {e}")
-
 
 reload_all_accounts()
 
@@ -306,7 +300,13 @@ netfilter-persistent save 2>/dev/null || true
     return base64.b64encode(script.encode("utf-8")).decode("utf-8")
 
 
+IMAGE_CACHE = {}
+
 def find_ubuntu_24_image(acc: OCIAccount, arch: str) -> str:
+    cache_key = f"{acc.name}_{arch}"
+    if cache_key in IMAGE_CACHE:
+        return IMAGE_CACHE[cache_key]
+
     shape_target = "VM.Standard.A1.Flex" if arch == "aarch64" else "VM.Standard.E2.1.Micro"
     try:
         images = acc.compute_client.list_images(
@@ -318,6 +318,7 @@ def find_ubuntu_24_image(acc: OCIAccount, arch: str) -> str:
             sort_order="DESC",
         ).data
         if images:
+            IMAGE_CACHE[cache_key] = images[0].id
             return images[0].id
     except Exception as e:
         logger.warning(f"过滤镜像异常: {e}")
@@ -329,8 +330,10 @@ def find_ubuntu_24_image(acc: OCIAccount, arch: str) -> str:
         name = img.display_name.lower()
         if "24.04" in name:
             if arch == "aarch64" and ("aarch64" in name or "arm" in name):
+                IMAGE_CACHE[cache_key] = img.id
                 return img.id
             elif arch == "x86_64" and ("aarch64" not in name and "arm" not in name):
+                IMAGE_CACHE[cache_key] = img.id
                 return img.id
     raise RuntimeError(f"未在区域 {acc.config_dict['region']} 找到 Ubuntu 24.04 镜像")
 
@@ -500,21 +503,32 @@ def get_traffic_for_account(acc: OCIAccount, period: str = "month") -> str:
     return "\n".join(lines)
 
 
-# ================= 4. 后台定时任务 =================
+# ================= 4. 后台定时任务（修复 None 账号防丢与稳态绑定） =================
 async def sniper_job(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     chat_id = job.chat_id
     loop = asyncio.get_running_loop()
 
-    acc_name = context.chat_data.get("current_account")
+    job_payload = getattr(job, "data", None) or {}
+    
+    acc_name = job_payload.get("account") or context.chat_data.get("current_account")
+    
+    # 若仍然为 None，且系统中有账号，自动降级选择第一个，彻底杜绝 None 导致的误报退出
+    if not acc_name and ACCOUNTS:
+        acc_name = list(ACCOUNTS.keys())[0]
+        context.chat_data["current_account"] = acc_name
+
     acc = ACCOUNTS.get(acc_name)
     if not acc:
         job.schedule_removal()
         context.chat_data["is_sniping"] = False
-        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ 账号 `{acc_name}` 已失效，抢机终止。")
+        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ 账号 `{acc_name}` 无效或不存在，抢机终止。")
         return
 
-    spec = context.chat_data.get("current_spec", {"arch": "ARM", "ocpus": 1.0, "memory": 6.0, "boot_gbs": 50, "target_count": 1})
+    spec = context.chat_data.get("current_spec") or job_payload.get("spec", {
+        "arch": "ARM", "ocpus": 1.0, "memory": 6.0, "boot_gbs": 50, "target_count": 1
+    })
+
     attempts = context.chat_data.get("sniper_attempts", 0) + 1
     context.chat_data["sniper_attempts"] = attempts
 
@@ -579,9 +593,9 @@ def build_main_keyboard(is_sniping: bool, current_acc_name: str, spec: dict, int
     target_count = spec.get("target_count", 1)
 
     snip_btn = (
-        InlineKeyboardButton("🛑 停止抢机", callback_data="stop_sniper")
+        InlineKeyboardButton("🛑 停止抢机", callback_data="ask_stop_sniper")
         if is_sniping
-        else InlineKeyboardButton(f"🎯 开始抢机 (目标:{target_count}台)", callback_data="start_sniper")
+        else InlineKeyboardButton(f"🎯 开始抢机 (目标:{target_count}台)", callback_data="ask_start_sniper")
     )
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"👤 当前账号: 【{current_acc_name}】", callback_data="menu_accounts")],
@@ -739,7 +753,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     data = query.data
-    current_acc_name = context.chat_data.get("current_account", list(ACCOUNTS.keys())[0] if ACCOUNTS else "")
+
+    # 保障当前账号始终有默认值
+    current_acc_name = context.chat_data.get("current_account")
+    if not current_acc_name or current_acc_name not in ACCOUNTS:
+        current_acc_name = list(ACCOUNTS.keys())[0] if ACCOUNTS else ""
+        context.chat_data["current_account"] = current_acc_name
+
     acc = ACCOUNTS.get(current_acc_name)
     spec = context.chat_data.setdefault("current_spec", {"arch": "ARM", "ocpus": 1.0, "memory": 6.0, "boot_gbs": 50, "root_password": DEFAULT_ROOT_PASSWORD, "target_count": 1})
     interval = context.chat_data.setdefault("interval", DEFAULT_INTERVAL)
@@ -816,7 +836,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not acc:
             await query.edit_message_text("❌ 当前账号凭据失效")
             return
-        await query.edit_message_text(f"🖥 *[{acc.name}] 实例列表*", parse_mode="Markdown", reply_markup=build_instances_keyboard(acc))
+        await query.edit_message_text("⏳ 正在拉取实例列表中...")
+        try:
+            kb = await loop.run_in_executor(None, build_instances_keyboard, acc)
+            await query.edit_message_text(f"🖥 *[{acc.name}] 实例列表*", parse_mode="Markdown", reply_markup=kb)
+        except Exception as e:
+            await query.edit_message_text(f"❌ 获取实例失败: `{e}`", reply_markup=build_main_keyboard(is_sniping, current_acc_name, spec, interval))
 
     elif data.startswith("manage_inst_"):
         inst_id = data.replace("manage_inst_", "")
@@ -896,16 +921,49 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         spec["target_count"] = new_cnt
         await query.edit_message_text(f"✅ 目标开机数量已设为: *{new_cnt} 台*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
 
-    elif data == "start_sniper":
+    # ================= 二次确认：开始抢机 =================
+    elif data == "ask_start_sniper":
+        arch_desc = f"{int(spec['ocpus'])}C {int(spec['memory'])}G" if spec["arch"] == "ARM" else "1C 1G"
+        target_count = spec.get("target_count", 1)
+        confirm_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ 确认开始", callback_data="confirm_start_sniper"),
+                InlineKeyboardButton("❌ 取消", callback_data="menu_main"),
+            ]
+        ])
+        await query.edit_message_text(
+            f"⚠️ *确认启动抢机任务？*\n\n"
+            f"• 账号: *{current_acc_name}*\n"
+            f"• 规格: `{spec['arch']} ({arch_desc})`\n"
+            f"• 目标台数: `{target_count} 台`\n"
+            f"• 轮询间隔: `{interval} 秒`\n\n"
+            "确认后后台将按周期请求 OCI 开机 API 直至完成。",
+            parse_mode="Markdown",
+            reply_markup=confirm_kb,
+        )
+
+    elif data == "confirm_start_sniper":
         if is_sniping:
+            await query.edit_message_text("⚠️ 抢机任务已在运行中！", reply_markup=build_main_keyboard(True, current_acc_name, spec, interval))
             return
         context.chat_data["is_sniping"] = True
         context.chat_data["sniper_attempts"] = 0
         context.chat_data["created_count"] = 0
         target_count = spec.get("target_count", 1)
 
+        # 重点：将当前账号名称与规格直接固化至 job.data
+        job_data = {
+            "account": current_acc_name,
+            "spec": dict(spec),
+        }
+
         context.job_queue.run_repeating(
-            sniper_job, interval=interval, first=1, chat_id=chat_id, name=f"sniper_{chat_id}"
+            sniper_job,
+            interval=interval,
+            first=1,
+            chat_id=chat_id,
+            name=f"sniper_{chat_id}",
+            data=job_data,
         )
         desc = f"{int(spec['ocpus'])}C {int(spec['memory'])}G" if spec["arch"] == "ARM" else "1C 1G"
         add_bot_log(f"[*] 账号 [{current_acc_name}] 启动抢机 (目标: {target_count} 台)")
@@ -922,7 +980,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_main_keyboard(True, current_acc_name, spec, interval),
         )
 
-    elif data == "stop_sniper":
+    # ================= 二次确认：停止抢机 =================
+    elif data == "ask_stop_sniper":
+        confirm_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🛑 确认停止", callback_data="confirm_stop_sniper"),
+                InlineKeyboardButton("↩️ 取消并继续", callback_data="menu_main"),
+            ]
+        ])
+        await query.edit_message_text(
+            f"⚠️ *确认停止抢机？*\n\n"
+            f"账号: *{current_acc_name}*\n"
+            f"已尝试: `{context.chat_data.get('sniper_attempts', 0)}` 次\n"
+            f"已成功开出: `{context.chat_data.get('created_count', 0)}` 台\n\n"
+            "确认后定时任务将被立即移除。",
+            parse_mode="Markdown",
+            reply_markup=confirm_kb,
+        )
+
+    elif data == "confirm_stop_sniper":
         jobs = context.job_queue.get_jobs_by_name(f"sniper_{chat_id}")
         for j in jobs:
             j.schedule_removal()
@@ -939,19 +1015,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "menu_interval":
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("15s", callback_data="int_15"), InlineKeyboardButton("30s", callback_data="int_30"), InlineKeyboardButton("60s", callback_data="int_60")],
+            [InlineKeyboardButton("15s", callback_data="int_15"), InlineKeyboardButton("30s", callback_data="int_30"), InlineKeyboardButton("60s", callback_data="int_60"), InlineKeyboardButton("120s", callback_data="int_120")],
             [InlineKeyboardButton("🔙 返回", callback_data="menu_main")],
         ])
-        await query.edit_message_text("⏱ 选择抢机轮询间隔：", reply_markup=keyboard)
+        await query.edit_message_text("⏱ 选择抢机轮询间隔（防封号推荐 60s 或以上）：", reply_markup=keyboard)
 
     elif data.startswith("int_"):
         new_int = int(data.split("_")[1])
         context.chat_data["interval"] = new_int
         if is_sniping:
             jobs = context.job_queue.get_jobs_by_name(f"sniper_{chat_id}")
+            job_data = {"account": current_acc_name, "spec": dict(spec)}
             for j in jobs:
                 j.schedule_removal()
-            context.job_queue.run_repeating(sniper_job, interval=new_int, first=new_int, chat_id=chat_id, name=f"sniper_{chat_id}")
+            context.job_queue.run_repeating(
+                sniper_job,
+                interval=new_int,
+                first=new_int,
+                chat_id=chat_id,
+                name=f"sniper_{chat_id}",
+                data=job_data,
+            )
         await query.edit_message_text(f"✅ 轮询间隔已设为 `{new_int}` 秒！", reply_markup=build_main_keyboard(is_sniping, current_acc_name, spec, new_int))
 
 
