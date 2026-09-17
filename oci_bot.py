@@ -117,7 +117,8 @@ class OCIAccount:
         self.identity_client = oci.identity.IdentityClient(self.config_dict, **client_kwargs)
 
         self.compartment_id = self.config_dict["tenancy"]
-        self.availability_domain = None
+        self.availability_domains = []
+        self.ad_index = 0
         self.subnet_id = None
         self.vcn_id = None
 
@@ -139,7 +140,6 @@ class OCIAccount:
         return ""
 
     def test_proxy_connection(self) -> dict:
-        """测试该账号实际走出的出口 IP（按需调用，不消耗 OCI API）"""
         target_api = "https://api.ipify.org"
         t0 = time.time()
         try:
@@ -209,13 +209,13 @@ class OCIAccount:
         self._cache_boot_volumes_ts = 0.0
 
     def ensure_network_ready(self):
-        if self.availability_domain and self.subnet_id:
-            return
-
-        if not self.availability_domain:
+        if not self.availability_domains:
             ads = self.identity_client.list_availability_domains(self.compartment_id).data
             if ads:
-                self.availability_domain = ads[0].name
+                self.availability_domains = [ad.name for ad in ads]
+
+        if self.subnet_id:
+            return
 
         subnets = self.network_client.list_subnets(self.compartment_id).data
         if subnets:
@@ -266,6 +266,13 @@ class OCIAccount:
         self.subnet_id = subnet.id
         time.sleep(3)
         add_bot_log(f"[{self.name}] 默认公网已就绪: {self.subnet_id}")
+
+    def get_next_ad(self) -> str:
+        if not self.availability_domains:
+            self.ensure_network_ready()
+        ad = self.availability_domains[self.ad_index % len(self.availability_domains)]
+        self.ad_index += 1
+        return ad
 
     def open_all_security_ports(self) -> str:
         self.ensure_network_ready()
@@ -355,7 +362,7 @@ def reload_all_accounts():
 reload_all_accounts()
 
 
-# ================= 3. 业务工具函数 =================
+# ================= 3. 业务工具函数与架构智能镜像匹配 =================
 def generate_user_data(root_password: str) -> str:
     script = f"""#!/bin/bash
 echo "root:{root_password}" | chpasswd
@@ -375,40 +382,69 @@ netfilter-persistent save 2>/dev/null || true
 
 IMAGE_CACHE = {}
 
-def find_ubuntu_24_image(acc: OCIAccount, arch: str) -> str:
+def find_ubuntu_image(acc: OCIAccount, arch: str) -> str:
     cache_key = f"{acc.name}_{arch}"
     if cache_key in IMAGE_CACHE:
         return IMAGE_CACHE[cache_key]
 
-    shape_target = "VM.Standard.A1.Flex" if arch == "aarch64" else "VM.Standard.E2.1.Micro"
+    is_arm = (arch == "ARM" or arch == "aarch64")
+    shape_target = "VM.Standard.A1.Flex" if is_arm else "VM.Standard.E2.1.Micro"
+
+    versions_to_try = ["24.04", "22.04"] if is_arm else ["24.04", "22.04", "20.04"]
+    for ver in versions_to_try:
+        try:
+            images = acc.compute_client.list_images(
+                compartment_id=acc.compartment_id,
+                operating_system="Canonical Ubuntu",
+                operating_system_version=ver,
+                shape=shape_target,
+                sort_by="TIMECREATED",
+                sort_order="DESC",
+            ).data
+            if images:
+                IMAGE_CACHE[cache_key] = images[0].id
+                return images[0].id
+        except Exception:
+            pass
+
     try:
-        images = acc.compute_client.list_images(
+        all_images = acc.compute_client.list_images(
             compartment_id=acc.compartment_id,
-            operating_system="Canonical Ubuntu",
-            operating_system_version="24.04",
             shape=shape_target,
             sort_by="TIMECREATED",
-            sort_order="DESC",
+            sort_order="DESC"
         ).data
-        if images:
-            IMAGE_CACHE[cache_key] = images[0].id
-            return images[0].id
+        for img in all_images:
+            name = img.display_name.lower()
+            if "ubuntu" in name:
+                if is_arm and ("aarch64" in name or "arm" in name):
+                    IMAGE_CACHE[cache_key] = img.id
+                    return img.id
+                elif not is_arm and ("aarch64" not in name and "arm" not in name):
+                    IMAGE_CACHE[cache_key] = img.id
+                    return img.id
     except Exception as e:
-        logger.warning(f"过滤镜像异常: {e}")
+        logger.warning(f"全量镜像检索异常: {e}")
 
-    all_images = acc.compute_client.list_images(
-        compartment_id=acc.compartment_id, sort_by="TIMECREATED", sort_order="DESC"
-    ).data
-    for img in all_images:
-        name = img.display_name.lower()
-        if "24.04" in name:
-            if arch == "aarch64" and ("aarch64" in name or "arm" in name):
-                IMAGE_CACHE[cache_key] = img.id
-                return img.id
-            elif arch == "x86_64" and ("aarch64" not in name and "arm" not in name):
-                IMAGE_CACHE[cache_key] = img.id
-                return img.id
-    raise RuntimeError(f"未在区域 {acc.config_dict['region']} 找到 Ubuntu 24.04 镜像")
+    try:
+        fallback_images = acc.compute_client.list_images(
+            compartment_id=acc.compartment_id,
+            sort_by="TIMECREATED",
+            sort_order="DESC"
+        ).data
+        for img in fallback_images:
+            name = img.display_name.lower()
+            if "ubuntu" in name:
+                if is_arm and ("aarch64" in name or "arm" in name):
+                    IMAGE_CACHE[cache_key] = img.id
+                    return img.id
+                elif not is_arm and ("aarch64" not in name and "arm" not in name):
+                    IMAGE_CACHE[cache_key] = img.id
+                    return img.id
+    except Exception as e:
+        logger.warning(f"终极回退镜像检索异常: {e}")
+
+    raise RuntimeError(f"未在区域 {acc.config_dict['region']} 找到适配 {arch} 的 Ubuntu 镜像")
 
 
 IP_CACHE: dict[str, tuple[str, str, float]] = {}
@@ -455,8 +491,11 @@ def launch_vm(acc: OCIAccount, spec: dict, current_idx: int = 1) -> dict:
     except Exception as e:
         return {"success": False, "reason": f"网络初始化失败: {e}", "fatal": True}
 
-    if not acc.subnet_id or not acc.availability_domain:
-        return {"success": False, "reason": "未找到公共子网 (Subnet)", "fatal": True}
+    if not acc.subnet_id or not acc.availability_domains:
+        return {"success": False, "reason": "未找到可用区 (AD) 或公共子网", "fatal": True}
+
+    target_ad = acc.get_next_ad()
+    ad_short = target_ad.split(":")[-1] if ":" in target_ad else target_ad
 
     metadata = {
         "ssh_authorized_keys": DUMMY_SSH_KEY,
@@ -464,11 +503,12 @@ def launch_vm(acc: OCIAccount, spec: dict, current_idx: int = 1) -> dict:
     }
 
     ts_suffix = str(int(time.time()))[-4:]
+    img_id = find_ubuntu_image(acc, arch)
+
     if arch == "ARM":
-        img_id = find_ubuntu_24_image(acc, "aarch64")
         details = oci.core.models.LaunchInstanceDetails(
             compartment_id=acc.compartment_id,
-            availability_domain=acc.availability_domain,
+            availability_domain=target_ad,
             display_name=f"Free-ARM-{int(spec['ocpus'])}C{int(spec['memory'])}G-#{current_idx}-{ts_suffix}",
             shape="VM.Standard.A1.Flex",
             shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
@@ -486,10 +526,9 @@ def launch_vm(acc: OCIAccount, spec: dict, current_idx: int = 1) -> dict:
             metadata=metadata,
         )
     else:
-        img_id = find_ubuntu_24_image(acc, "x86_64")
         details = oci.core.models.LaunchInstanceDetails(
             compartment_id=acc.compartment_id,
-            availability_domain=acc.availability_domain,
+            availability_domain=target_ad,
             display_name=f"Free-AMD-1C1G-#{current_idx}-{ts_suffix}",
             shape="VM.Standard.E2.1.Micro",
             source_details=oci.core.models.InstanceSourceViaImageDetails(
@@ -518,9 +557,11 @@ def launch_vm(acc: OCIAccount, spec: dict, current_idx: int = 1) -> dict:
         }
     except oci.exceptions.ServiceError as e:
         if "Out of host capacity" in str(e.message) or e.status == 500:
-            return {"success": False, "reason": "无容量 (Out of capacity)"}
+            return {"success": False, "reason": f"[{ad_short}] 无容量 (Out of capacity)"}
         elif e.status == 429:
             return {"success": False, "reason": "API 限流 (429)"}
+        elif e.code == "NotAuthorizedOrNotFound" or e.status == 404:
+            return {"success": False, "reason": f"[{ad_short}] 无此规格，自动换可用区", "fatal": False}
         return {"success": False, "reason": f"[{e.code}] {e.message}", "fatal": True}
     except Exception as e:
         return {"success": False, "reason": str(e)}
@@ -680,7 +721,7 @@ async def sniper_job(context: ContextTypes.DEFAULT_TYPE):
             f"🖥 实例名: `{result['name']}`\n"
             f"🌐 公网 IP: `{result.get('public_ip')}`\n"
             f"⚙️ 规格: `{spec['arch']} ({desc})`\n"
-            f"💾 引导卷: `{spec['boot_gbs']} GB` | 系统: `Ubuntu 24.04`\n"
+            f"💾 引导卷: `{spec['boot_gbs']} GB`\n"
             f"👤 用户名: `root`\n"
             f"🔑 密码: `{spec.get('root_password', DEFAULT_ROOT_PASSWORD)}`\n\n"
         )
@@ -716,7 +757,7 @@ async def sniper_job(context: ContextTypes.DEFAULT_TYPE):
             )
 
 
-# ================= 5. TG 交互键盘构建 =================
+# ================= 5. TG 交互键盘构建（支持状态高亮变绿） =================
 def get_account_state(chat_data: dict, acc_name: str) -> dict:
     return chat_data.setdefault("accounts_state", {}).setdefault(acc_name, {
         "is_sniping": False,
@@ -895,13 +936,34 @@ def build_traffic_keyboard(current_period: str = "month"):
 
 
 def build_spec_keyboard(spec: dict):
+    arch = spec.get("arch", "ARM")
+    ocpus = float(spec.get("ocpus", 1.0))
+    memory = float(spec.get("memory", 6.0))
+    boot_gbs = int(spec.get("boot_gbs", 50))
     target_count = spec.get("target_count", 1)
+
+    is_arm_1_6 = (arch == "ARM" and ocpus == 1.0 and memory == 6.0)
+    is_arm_2_12 = (arch == "ARM" and ocpus == 2.0 and memory == 12.0)
+    is_arm_4_24 = (arch == "ARM" and ocpus == 4.0 and memory == 24.0)
+    is_amd_1_1 = (arch == "AMD")
+
+    is_disk_50 = (boot_gbs == 50)
+    is_disk_100 = (boot_gbs == 100)
+
+    btn_arm_1_6 = f"{'✅ ' if is_arm_1_6 else '🔘 '}ARM 1C 6G (免费)"
+    btn_arm_2_12 = f"{'✅ ' if is_arm_2_12 else '🔘 '}ARM 2C 12G"
+    btn_arm_4_24 = f"{'✅ ' if is_arm_4_24 else '🔘 '}ARM 4C 24G (顶配)"
+    btn_amd_1_1 = f"{'✅ ' if is_amd_1_1 else '🔘 '}AMD 1C 1G (微型)"
+
+    btn_disk_50 = f"{'✅ ' if is_disk_50 else '💾 '}硬盘: 50 GB"
+    btn_disk_100 = f"{'✅ ' if is_disk_100 else '💾 '}硬盘: 100 GB"
+
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔘 ARM 1C 6G (免费)", callback_data="set_arm_1_6"), InlineKeyboardButton("🔘 ARM 2C 12G", callback_data="set_arm_2_12")],
-        [InlineKeyboardButton("🔘 ARM 4C 24G (顶配)", callback_data="set_arm_4_24"), InlineKeyboardButton("🔘 AMD 1C 1G (微型)", callback_data="set_amd_1_1")],
-        [InlineKeyboardButton("💾 硬盘: 50 GB", callback_data="set_disk_50"), InlineKeyboardButton("💾 硬盘: 100 GB", callback_data="set_disk_100")],
+        [InlineKeyboardButton(btn_arm_1_6, callback_data="set_arm_1_6"), InlineKeyboardButton(btn_arm_2_12, callback_data="set_arm_2_12")],
+        [InlineKeyboardButton(btn_arm_4_24, callback_data="set_arm_4_24"), InlineKeyboardButton(btn_amd_1_1, callback_data="set_amd_1_1")],
+        [InlineKeyboardButton(btn_disk_50, callback_data="set_disk_50"), InlineKeyboardButton(btn_disk_100, callback_data="set_disk_100")],
         [
-            InlineKeyboardButton("🔢 目标开机数量:", callback_data="none"),
+            InlineKeyboardButton("🔢 目标数量:", callback_data="none"),
             InlineKeyboardButton(f"{'✅ ' if target_count==1 else ''}1台", callback_data="set_count_1"),
             InlineKeyboardButton(f"{'✅ ' if target_count==2 else ''}2台", callback_data="set_count_2"),
             InlineKeyboardButton(f"{'✅ ' if target_count==3 else ''}3台", callback_data="set_count_3"),
@@ -954,7 +1016,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• 目标机型: `{spec['arch']} ({int(spec['ocpus'])}C {int(spec['memory'])}G | {spec['boot_gbs']}G)`\n"
         f"• 🎯 目标开机台数: `{target_count} 台`\n"
         f"• 抢机状态: `{'🚀 正在运行' if is_sniping else '💤 待机'}`\n\n"
-        "💡 点击「🌐 测试出口 IP」可实时校验当前账号使用的代理节点。",
+        "💡 纯本地缓存防封号优化：仅在主动操作时按需调用 API。",
         parse_mode="Markdown",
         reply_markup=build_main_keyboard(is_sniping, current_acc, spec, interval),
     )
@@ -1012,7 +1074,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_main_keyboard(is_sniping, current_acc_name, spec, interval),
         )
 
-    # ================= 原生测试账号代理连通性 =================
     elif data == "action_test_proxy":
         if not acc:
             await query.edit_message_text("❌ 当前账号凭据失效")
@@ -1029,7 +1090,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_proxy = test_res.get("is_proxy")
 
             if is_proxy:
-                # 拿到了非本机 IP 并且代理开启
                 status_icon = "🟢" if exit_ip != server_ip else "🟡"
                 proxy_clean = acc.proxy_url.split("@")[-1]
                 msg_body = (
@@ -1415,40 +1475,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⚙️ *[{current_acc_name}] 规格与开机数量调整*\n\n"
             f"• 当前选定: *{spec['arch']}* (`{arch_desc}` | `{spec['boot_gbs']} GB`)\n"
             f"• 🎯 目标开机台数: *{target_count} 台*\n"
-            f"• 系统默认: `Ubuntu 24.04 LTS`",
+            f"• 系统: `Ubuntu (多可用区全域智能适配)`",
             parse_mode="Markdown",
             reply_markup=build_spec_keyboard(spec),
         )
 
     elif data == "set_arm_1_6":
         spec.update({"arch": "ARM", "ocpus": 1.0, "memory": 6.0})
-        await query.edit_message_text("✅ 已切换: *ARM 1C 6G*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
+        await query.edit_message_text(f"⚙️ *[{current_acc_name}] 规格调整*\n\n当前已选择: *ARM 1C 6G*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
 
     elif data == "set_arm_2_12":
         spec.update({"arch": "ARM", "ocpus": 2.0, "memory": 12.0})
-        await query.edit_message_text("✅ 已切换: *ARM 2C 12G*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
+        await query.edit_message_text(f"⚙️ *[{current_acc_name}] 规格调整*\n\n当前已选择: *ARM 2C 12G*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
 
     elif data == "set_arm_4_24":
         spec.update({"arch": "ARM", "ocpus": 4.0, "memory": 24.0})
-        await query.edit_message_text("✅ 已切换: *ARM 4C 24G*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
+        await query.edit_message_text(f"⚙️ *[{current_acc_name}] 规格调整*\n\n当前已选择: *ARM 4C 24G*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
 
     elif data == "set_amd_1_1":
         spec.update({"arch": "AMD", "ocpus": 1.0, "memory": 1.0})
-        await query.edit_message_text("✅ 已切换: *AMD 1C 1G*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
+        await query.edit_message_text(f"⚙️ *[{current_acc_name}] 规格调整*\n\n当前已选择: *AMD 1C 1G*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
 
     elif data == "set_disk_50":
         spec["boot_gbs"] = 50
-        await query.edit_message_text("✅ 引导卷已设为: *50 GB*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
+        await query.edit_message_text(f"⚙️ *[{current_acc_name}] 硬盘调整*\n\n引导卷已设为: *50 GB*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
 
     elif data == "set_disk_100":
         spec["boot_gbs"] = 100
-        await query.edit_message_text("✅ 引导卷已设为: *100 GB*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
+        await query.edit_message_text(f"⚙️ *[{current_acc_name}] 硬盘调整*\n\n引导卷已设为: *100 GB*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
 
     elif data.startswith("set_count_"):
         new_cnt = int(data.split("_")[2])
         spec["target_count"] = new_cnt
-        await query.edit_message_text(f"✅ 目标开机数量已设为: *{new_cnt} 台*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
+        await query.edit_message_text(f"⚙️ *[{current_acc_name}] 目标数量调整*\n\n开机目标已设为: *{new_cnt} 台*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
 
+    # ================= 二次确认：开始抢机 =================
     elif data == "ask_start_sniper":
         arch_desc = f"{int(spec['ocpus'])}C {int(spec['memory'])}G" if spec["arch"] == "ARM" else "1C 1G"
         target_count = spec.get("target_count", 1)
@@ -1469,7 +1530,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• 💾 引导卷: `{boot_gbs} GB`\n"
             f"• 目标台数: `{target_count} 台`\n"
             f"• 轮询间隔: `{interval} 秒`\n\n"
-            "确认后该账号将在后台独立启动抢机任务，与其他账号互不影响。",
+            "确认后该账号将在后台独立启动抢机任务，多可用区自动轮询。",
             parse_mode="Markdown",
             reply_markup=confirm_kb,
         )
@@ -1515,6 +1576,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_main_keyboard(True, current_acc_name, spec, interval),
         )
 
+    # ================= 二次确认：停止抢机 =================
     elif data == "ask_stop_sniper":
         confirm_kb = InlineKeyboardMarkup([
             [
