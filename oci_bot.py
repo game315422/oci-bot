@@ -204,14 +204,14 @@ class OCIAccount:
             source="0.0.0.0/0",
             source_type="CIDR_BLOCK",
             is_stateless=False,
-            description="Allow All Traffic by TG Bot"
+            description="Allow All Ingress by TG Bot"
         )
         update_details = oci.core.models.UpdateSecurityListDetails(
             ingress_security_rules=[ingress_rule_all],
             egress_security_rules=target_sec_list.egress_security_rules
         )
         self.network_client.update_security_list(target_sec_list.id, update_details)
-        return f"VCN 安全列表 (`{target_sec_list.display_name}`) 入站端口已全部放行 (`0.0.0.0/0`)！"
+        return f"VCN 安全列表 (`{target_sec_list.display_name}`) 入站端口已配置放行 (`0.0.0.0/0`)！"
 
 
 ACCOUNTS: dict[str, OCIAccount] = {}
@@ -450,7 +450,7 @@ def get_traffic_for_account(acc: OCIAccount, period: str = "month") -> str:
     return "\n".join(lines)
 
 
-# ================= 4. 后台定时任务（支持开机数量目标） =================
+# ================= 4. 后台定时任务 =================
 async def sniper_job(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     chat_id = job.chat_id
@@ -492,7 +492,6 @@ async def sniper_job(context: ContextTypes.DEFAULT_TYPE):
         )
 
         if created_count >= target_count:
-            # 达到全部目标数量，停止抢机
             job.schedule_removal()
             context.chat_data["is_sniping"] = False
             msg += f"🏁 *已全部达成目标开机数量（共 {target_count} 台），任务顺利完成！*"
@@ -513,11 +512,9 @@ async def sniper_job(context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # 记录到内存日志
         add_bot_log(f"[{acc.name}-{spec['arch']}] 第{attempts}次重试: {result.get('reason')}")
 
-        if attempts % 50 == 0:
-            interval = context.chat_data.get("interval", DEFAULT_INTERVAL)
+        if attempts % 500 == 0:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"⏳ *[{acc.name}] 持续抢机中 (第 {attempts} 次)*\n进度: `({created_count}/{target_count}台)` | 状态: `{result.get('reason')}`",
@@ -545,7 +542,7 @@ def build_main_keyboard(is_sniping: bool, current_acc_name: str, spec: dict, int
         ],
         [
             InlineKeyboardButton("⚡ 实例电源", callback_data="menu_instances"),
-            InlineKeyboardButton("🔓 端口全开 (放行全协议)", callback_data="action_open_ports"),
+            InlineKeyboardButton("🔓 端口全开 (甲骨文入站)", callback_data="action_open_ports"),
         ],
         [
             InlineKeyboardButton("📜 查看实时日志", callback_data="view_logs"),
@@ -611,7 +608,6 @@ def build_spec_keyboard(spec: dict):
         [InlineKeyboardButton("🔘 ARM 1C 6G (免费)", callback_data="set_arm_1_6"), InlineKeyboardButton("🔘 ARM 2C 12G", callback_data="set_arm_2_12")],
         [InlineKeyboardButton("🔘 ARM 4C 24G (顶配)", callback_data="set_arm_4_24"), InlineKeyboardButton("🔘 AMD 1C 1G (微型)", callback_data="set_amd_1_1")],
         [InlineKeyboardButton("💾 硬盘: 50 GB", callback_data="set_disk_50"), InlineKeyboardButton("💾 硬盘: 100 GB", callback_data="set_disk_100")],
-        # 新增：开机数量调节
         [
             InlineKeyboardButton("🔢 目标开机数量:", callback_data="none"),
             InlineKeyboardButton(f"{'✅ ' if target_count==1 else ''}1台", callback_data="set_count_1"),
@@ -709,17 +705,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_main_keyboard(is_sniping, current_acc_name, spec, interval),
         )
 
-    # 查看实时日志
     elif data == "view_logs":
         recent_logs = list(LOG_HISTORY)[-15:]
-        if not recent_logs:
-            log_text = "（暂无日志记录）"
-        else:
-            log_text = "\n".join(recent_logs)
-
+        log_text = "\n".join(recent_logs) if recent_logs else "（暂无日志记录）"
         now_str = datetime.now().strftime("%H:%M:%S")
+        text_lines = [
+            f"📜 *系统实时日志 (最近 15 条 - {now_str})*",
+            "",
+            "```text",
+            log_text,
+            "```",
+        ]
         await query.edit_message_text(
-            f"📜 *系统实时日志 (最近 15 条 - {now_str})*\n\n```text\n{log_text}\n```",
+            text="\n".join(text_lines),
             parse_mode="Markdown",
             reply_markup=build_logs_keyboard(),
         )
@@ -728,12 +726,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not acc:
             await query.edit_message_text("❌ 当前账号凭据失效")
             return
-        await query.edit_message_text("⏳ 正在为当前账号配置安全列表，开放全部入站端口 (0.0.0.0/0)...")
+        await query.edit_message_text("⏳ 正在为当前账号配置安全列表，开放入站端口 (0.0.0.0/0)...")
         try:
             result_str = await loop.run_in_executor(None, acc.open_all_security_ports)
-            add_bot_log(f"[{acc.name}] 端口全开成功")
+            add_bot_log(f"[{acc.name}] 端口放行成功")
             await query.edit_message_text(
-                f"✅ *安全列表端口全开成功！*\n\n{result_str}\n\n💡 *提示*：脚本开机时自带清理系统内 iptables 规则，所有端口均可直接外部访问。",
+                f"✅ *安全列表配置成功！*\n\n{result_str}\n\n💡 *提示*：脚本开机时自带清理系统内 iptables 规则，所有端口均可外部直连。",
                 parse_mode="Markdown",
                 reply_markup=build_main_keyboard(is_sniping, current_acc_name, spec, interval),
             )
@@ -843,7 +841,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         spec["boot_gbs"] = 100
         await query.edit_message_text("✅ 引导卷已设为: *100 GB*", parse_mode="Markdown", reply_markup=build_spec_keyboard(spec))
 
-    # 设定目标开机数量 (1~4 台)
     elif data.startswith("set_count_"):
         new_cnt = int(data.split("_")[2])
         spec["target_count"] = new_cnt
@@ -854,7 +851,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.chat_data["is_sniping"] = True
         context.chat_data["sniper_attempts"] = 0
-        context.chat_data["created_count"] = 0  # 重置已开出计数
+        context.chat_data["created_count"] = 0
         target_count = spec.get("target_count", 1)
 
         context.job_queue.run_repeating(
