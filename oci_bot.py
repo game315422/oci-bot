@@ -193,25 +193,75 @@ class OCIAccount:
         add_bot_log(f"[{self.name}] 默认公网已就绪: {self.subnet_id}")
 
     def open_all_security_ports(self) -> str:
+        """遍历账号下所有 VCN 的安全列表和安全组，彻底放开 0.0.0.0/0 所有入站端口"""
         self.ensure_network_ready()
-        sec_lists = self.network_client.list_security_lists(self.compartment_id, vcn_id=self.vcn_id).data
-        if not sec_lists:
-            raise RuntimeError("未找到该 VCN 的安全列表")
-        target_sec_list = sec_lists[0]
+        
+        # 1. 查询该区间下所有 VCN
+        vcns = self.network_client.list_vcns(self.compartment_id).data
+        if not vcns:
+            raise RuntimeError("未在当前区间检测到任何可用 VCN")
 
-        ingress_rule_all = oci.core.models.IngressSecurityRule(
-            protocol="all",
-            source="0.0.0.0/0",
-            source_type="CIDR_BLOCK",
-            is_stateless=False,
-            description="Allow All Ingress by TG Bot"
-        )
-        update_details = oci.core.models.UpdateSecurityListDetails(
-            ingress_security_rules=[ingress_rule_all],
-            egress_security_rules=target_sec_list.egress_security_rules
-        )
-        self.network_client.update_security_list(target_sec_list.id, update_details)
-        return f"VCN 安全列表 (`{target_sec_list.display_name}`) 入站端口已配置放行 (`0.0.0.0/0`)！"
+        modified_lists = 0
+        modified_nsgs = 0
+
+        for vcn in vcns:
+            # 2. 处理该 VCN 下的所有安全列表 (Security Lists)
+            sec_lists = self.network_client.list_security_lists(self.compartment_id, vcn_id=vcn.id).data
+            for sec_list in sec_lists:
+                # 检查是否已存在全放行规则
+                has_all_open = any(
+                    rule.protocol == "all" and rule.source == "0.0.0.0/0"
+                    for rule in sec_list.ingress_security_rules
+                )
+                
+                new_ingress = list(sec_list.ingress_security_rules)
+                if not has_all_open:
+                    rule_all = oci.core.models.IngressSecurityRule(
+                        protocol="all",
+                        source="0.0.0.0/0",
+                        source_type="CIDR_BLOCK",
+                        is_stateless=False,
+                        description="Allow All Traffic Ingress (Bot Auto)"
+                    )
+                    new_ingress.append(rule_all)
+
+                update_details = oci.core.models.UpdateSecurityListDetails(
+                    ingress_security_rules=new_ingress,
+                    egress_security_rules=sec_list.egress_security_rules
+                )
+                self.network_client.update_security_list(sec_list.id, update_details)
+                modified_lists += 1
+
+            # 3. 处理该 VCN 下的所有网络安全组 (NSG)
+            try:
+                nsgs = self.network_client.list_network_security_groups(
+                    compartment_id=self.compartment_id, 
+                    vcn_id=vcn.id
+                ).data
+                for nsg in nsgs:
+                    rules = self.network_client.list_network_security_group_security_rules(nsg.id).data
+                    has_nsg_all = any(
+                        r.direction == "INGRESS" and r.protocol == "all" and r.source == "0.0.0.0/0"
+                        for r in rules
+                    )
+                    if not has_nsg_all:
+                        add_rule = oci.core.models.AddSecurityRuleDetails(
+                            direction="INGRESS",
+                            protocol="all",
+                            source="0.0.0.0/0",
+                            source_type="CIDR_BLOCK",
+                            is_stateless=False,
+                            description="Allow All Traffic Ingress (Bot Auto)"
+                        )
+                        self.network_client.add_network_security_group_security_rules(
+                            nsg.id,
+                            oci.core.models.AddNetworkSecurityGroupSecurityRulesDetails(security_rules=[add_rule])
+                        )
+                        modified_nsgs += 1
+            except Exception as nsg_err:
+                logger.warning(f"检查网络安全组异常: {nsg_err}")
+
+        return f"已成功更新 `{len(vcns)}` 个 VCN：\n• 安全列表 (Security Lists): 共放行 `{modified_lists}` 个\n• 网络安全组 (NSG): 共放行 `{modified_nsgs}` 个\n全部入站协议与端口 (`0.0.0.0/0:all`) 现已全通！"
 
 
 ACCOUNTS: dict[str, OCIAccount] = {}
@@ -542,7 +592,7 @@ def build_main_keyboard(is_sniping: bool, current_acc_name: str, spec: dict, int
         ],
         [
             InlineKeyboardButton("⚡ 实例电源", callback_data="menu_instances"),
-            InlineKeyboardButton("🔓 端口全开 (甲骨文入站)", callback_data="action_open_ports"),
+            InlineKeyboardButton("🔓 端口全开 (甲骨文后台规则)", callback_data="action_open_ports"),
         ],
         [
             InlineKeyboardButton("📜 查看实时日志", callback_data="view_logs"),
@@ -726,12 +776,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not acc:
             await query.edit_message_text("❌ 当前账号凭据失效")
             return
-        await query.edit_message_text("⏳ 正在为当前账号配置安全列表，开放入站端口 (0.0.0.0/0)...")
+        await query.edit_message_text("⏳ 正在为当前账号后台所有安全列表 (Security Lists) 与安全组 (NSG) 放开入站规则 (0.0.0.0/0)...")
         try:
             result_str = await loop.run_in_executor(None, acc.open_all_security_ports)
-            add_bot_log(f"[{acc.name}] 端口放行成功")
+            add_bot_log(f"[{acc.name}] 甲骨文后台规则端口全开成功")
             await query.edit_message_text(
-                f"✅ *安全列表配置成功！*\n\n{result_str}\n\n💡 *提示*：脚本开机时自带清理系统内 iptables 规则，所有端口均可外部直连。",
+                f"✅ *甲骨文后台防火墙放行成功！*\n\n{result_str}\n\n💡 *说明*：OCI 云后台安全列表及安全组均已放行全部流量，同时系统内防火墙在开机时也会清空放通。",
                 parse_mode="Markdown",
                 reply_markup=build_main_keyboard(is_sniping, current_acc_name, spec, interval),
             )
